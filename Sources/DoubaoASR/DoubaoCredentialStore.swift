@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import Security
+import TalkerCommonSync
 
 struct DeviceCredentials: Codable {
     var deviceId: String
@@ -20,8 +21,11 @@ public final class DoubaoCredentialStore {
     /// they would race over the same on-disk cache.
     public static let shared = DoubaoCredentialStore()
 
-    private let lock = NSLock()
-    private var cached: DeviceCredentials?
+    /// Mutable cache + its lock, fused into one value via `Lock<T>`. The
+    /// `withLock` API forces every access through the lock and prevents the
+    /// "lock held across an await point" footgun that bare `NSLock` invites
+    /// once async/await is in the picture.
+    private let cached: Lock<DeviceCredentials?>
     private let fileURL: URL
 
     enum DoubaoError: Error, LocalizedError {
@@ -45,7 +49,7 @@ public final class DoubaoCredentialStore {
         let dir = support.appendingPathComponent("SpeechMore", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.fileURL = dir.appendingPathComponent("credentials.json")
-        self.cached = Self.load(from: fileURL)
+        self.cached = Lock(Self.load(from: fileURL))
     }
 
     /// Fire-and-forget background refresh so the first call has zero registration latency.
@@ -57,10 +61,10 @@ public final class DoubaoCredentialStore {
 
     /// Wipe the cached credentials.json and re-register on next ensureCredentials().
     public func reset() {
-        lock.lock()
-        defer { lock.unlock() }
-        cached = nil
-        try? FileManager.default.removeItem(at: fileURL)
+        cached.withLock { c in
+            c = nil
+            try? FileManager.default.removeItem(at: fileURL)
+        }
     }
 
     /// Path to the on-disk credential cache. Read-only; intended for
@@ -69,23 +73,22 @@ public final class DoubaoCredentialStore {
 
     /// Synchronous; never call from the main thread on first run.
     func ensureCredentials() throws -> DeviceCredentials {
-        lock.lock()
-        defer { lock.unlock() }
-
-        if var c = cached, !c.deviceId.isEmpty {
-            if c.token.isEmpty || Self.isJWTExpired(c.token) {
-                c.token = try fetchToken(deviceId: c.deviceId, cdid: c.cdid)
-                cached = c
-                try? Self.save(c, to: fileURL)
+        try cached.withLock { c in
+            if var existing = c, !existing.deviceId.isEmpty {
+                if existing.token.isEmpty || Self.isJWTExpired(existing.token) {
+                    existing.token = try fetchToken(deviceId: existing.deviceId, cdid: existing.cdid)
+                    c = existing
+                    try? Self.save(existing, to: fileURL)
+                }
+                return existing
             }
-            return c
-        }
 
-        var c = try registerDevice()
-        c.token = try fetchToken(deviceId: c.deviceId, cdid: c.cdid)
-        cached = c
-        try? Self.save(c, to: fileURL)
-        return c
+            var fresh = try registerDevice()
+            fresh.token = try fetchToken(deviceId: fresh.deviceId, cdid: fresh.cdid)
+            c = fresh
+            try? Self.save(fresh, to: fileURL)
+            return fresh
+        }
     }
 
     static func isJWTExpired(_ token: String, marginSec: TimeInterval = 60) -> Bool {

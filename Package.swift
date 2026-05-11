@@ -7,9 +7,15 @@ let package = Package(
     products: [
         .library(name: "DoubaoASR", targets: ["DoubaoASR"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/gfreezy/talkercommon", exact: "20260505.0.3")
+    ],
     targets: [
         .target(
             name: "DoubaoASR",
+            dependencies: [
+                .product(name: "TalkerCommonSync", package: "talkercommon")
+            ],
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("AudioToolbox")
