@@ -1,7 +1,6 @@
 import Foundation
 import CryptoKit
 import Security
-import TalkerCommonSync
 
 struct DeviceCredentials: Codable {
     var deviceId: String
@@ -16,20 +15,13 @@ struct DeviceCredentials: Codable {
 /// before any ASR call. Credentials are cached to
 /// `~/Library/Application Support/SpeechMore/credentials.json` so subsequent
 /// app launches start in milliseconds.
-/// Thread-safe by construction: `cached` is wrapped in `Lock<T>` and `fileURL`
-/// is immutable. `@unchecked Sendable` so `static let shared` is allowed under
-/// Swift 6's strict-concurrency checking.
-public final class DoubaoCredentialStore: @unchecked Sendable {
+public actor DoubaoCredentialStore {
     /// Shared singleton. There is no reason to construct multiple instances —
     /// they would race over the same on-disk cache.
     public static let shared = DoubaoCredentialStore()
 
-    /// Mutable cache + its lock, fused into one value via `Lock<T>`. The
-    /// `withLock` API forces every access through the lock and prevents the
-    /// "lock held across an await point" footgun that bare `NSLock` invites
-    /// once async/await is in the picture.
-    private let cached: Lock<DeviceCredentials?>
-    private let fileURL: URL
+    private var cached: DeviceCredentials?
+    nonisolated let fileURL: URL
 
     enum DoubaoError: Error, LocalizedError {
         case registrationFailed(String)
@@ -52,46 +44,40 @@ public final class DoubaoCredentialStore: @unchecked Sendable {
         let dir = support.appendingPathComponent("SpeechMore", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.fileURL = dir.appendingPathComponent("credentials.json")
-        self.cached = Lock(Self.load(from: fileURL))
+        self.cached = Self.load(from: fileURL)
     }
 
     /// Fire-and-forget background refresh so the first call has zero registration latency.
-    public func warmup() {
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            _ = try? self?.ensureCredentials()
-        }
+    public nonisolated func warmup() {
+        Task { _ = try? await self.ensureCredentials() }
     }
 
     /// Wipe the cached credentials.json and re-register on next ensureCredentials().
     public func reset() {
-        cached.withLock { c in
-            c = nil
-            try? FileManager.default.removeItem(at: fileURL)
-        }
+        cached = nil
+        try? FileManager.default.removeItem(at: fileURL)
     }
 
     /// Path to the on-disk credential cache. Read-only; intended for
     /// diagnostics ("show me where it's stored") and integration tests.
-    public var fileURLForDiagnostics: URL { fileURL }
+    public nonisolated var fileURLForDiagnostics: URL { fileURL }
 
-    /// Synchronous; never call from the main thread on first run.
-    func ensureCredentials() throws -> DeviceCredentials {
-        try cached.withLock { c in
-            if var existing = c, !existing.deviceId.isEmpty {
-                if existing.token.isEmpty || Self.isJWTExpired(existing.token) {
-                    existing.token = try fetchToken(deviceId: existing.deviceId, cdid: existing.cdid)
-                    c = existing
-                    try? Self.save(existing, to: fileURL)
-                }
-                return existing
+    /// Returns valid credentials, registering and/or refreshing the token as needed.
+    func ensureCredentials() async throws -> DeviceCredentials {
+        if var existing = cached, !existing.deviceId.isEmpty {
+            if existing.token.isEmpty || Self.isJWTExpired(existing.token) {
+                existing.token = try await fetchToken(deviceId: existing.deviceId, cdid: existing.cdid)
+                cached = existing
+                try? Self.save(existing, to: fileURL)
             }
-
-            var fresh = try registerDevice()
-            fresh.token = try fetchToken(deviceId: fresh.deviceId, cdid: fresh.cdid)
-            c = fresh
-            try? Self.save(fresh, to: fileURL)
-            return fresh
+            return existing
         }
+
+        var fresh = try await registerDevice()
+        fresh.token = try await fetchToken(deviceId: fresh.deviceId, cdid: fresh.cdid)
+        cached = fresh
+        try? Self.save(fresh, to: fileURL)
+        return fresh
     }
 
     static func isJWTExpired(_ token: String, marginSec: TimeInterval = 60) -> Bool {
@@ -107,7 +93,7 @@ public final class DoubaoCredentialStore: @unchecked Sendable {
 
     // MARK: - Registration
 
-    private func registerDevice() throws -> DeviceCredentials {
+    private func registerDevice() async throws -> DeviceCredentials {
         let cdid = UUID().uuidString.lowercased()
         let openudid = randomHex(bytes: 8)
         let clientudid = UUID().uuidString.lowercased()
@@ -168,7 +154,7 @@ public final class DoubaoCredentialStore: @unchecked Sendable {
         req.setValue(DoubaoConstants.userAgent, forHTTPHeaderField: "User-Agent")
         req.httpBody = bodyData
 
-        let (data, http) = try syncRequest(req)
+        let (data, http) = try await request(req)
         guard (200..<300).contains(http.statusCode) else {
             throw DoubaoError.registrationFailed("HTTP \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "")")
         }
@@ -205,7 +191,7 @@ public final class DoubaoCredentialStore: @unchecked Sendable {
 
     // MARK: - Token
 
-    private func fetchToken(deviceId: String, cdid: String) throws -> String {
+    private func fetchToken(deviceId: String, cdid: String) async throws -> String {
         var components = URLComponents(url: DoubaoConstants.settingsURL, resolvingAgainstBaseURL: false)!
         components.queryItems = [
             URLQueryItem(name: "device_platform", value: "android"),
@@ -232,7 +218,7 @@ public final class DoubaoCredentialStore: @unchecked Sendable {
         req.setValue(stub, forHTTPHeaderField: "x-ss-stub")
         req.httpBody = bodyData
 
-        let (data, http) = try syncRequest(req)
+        let (data, http) = try await request(req)
         guard (200..<300).contains(http.statusCode) else {
             throw DoubaoError.tokenFetchFailed("HTTP \(http.statusCode): \(String(data: data, encoding: .utf8) ?? "")")
         }
@@ -248,26 +234,17 @@ public final class DoubaoCredentialStore: @unchecked Sendable {
 
     // MARK: - Helpers
 
-    private func syncRequest(_ req: URLRequest) throws -> (Data, HTTPURLResponse) {
-        var outData: Data?
-        var outResp: URLResponse?
-        var outErr: Error?
-        let sem = DispatchSemaphore(value: 0)
+    private func request(_ req: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 15
         cfg.timeoutIntervalForResource = 20
         let session = URLSession(configuration: cfg)
-        let task = session.dataTask(with: req) { d, r, e in
-            outData = d; outResp = r; outErr = e; sem.signal()
-        }
-        task.resume()
-        sem.wait()
-        session.finishTasksAndInvalidate()
-        if let e = outErr { throw e }
-        guard let http = outResp as? HTTPURLResponse else {
+        defer { session.finishTasksAndInvalidate() }
+        let (data, resp) = try await session.data(for: req)
+        guard let http = resp as? HTTPURLResponse else {
             throw URLError(.badServerResponse)
         }
-        return (outData ?? Data(), http)
+        return (data, http)
     }
 
     private func randomHex(bytes count: Int) -> String {

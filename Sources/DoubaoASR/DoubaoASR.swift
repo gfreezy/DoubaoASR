@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import TalkerCommonSync
 
 /// Streaming Doubao IME ASR client. One recording per instance:
 /// call `start()` to begin capturing the mic and streaming to Doubao,
@@ -9,16 +10,14 @@ import AVFoundation
 /// the Python reference. Reusing the connection across recordings caused
 /// Doubao's per-device concurrent quota to fill up after a few fast
 /// sessions; the ~600ms TLS+StartTask cost per call is the price.
-public final class DoubaoASR: @unchecked Sendable {
+public actor DoubaoASR {
     private let audioEngine = AVAudioEngine()
     private var pcmConverter: AVAudioConverter?
-    private var pcmTargetFormat: AVAudioFormat!
+    private var pcmTargetFormat: AVAudioFormat?
     private var opusEncoder: OpusEncoder?
 
     private var session: URLSession?
     private var ws: URLSessionWebSocketTask?
-
-    private let queue = DispatchQueue(label: "com.doubaoasr.session", qos: .userInitiated)
 
     // State
     private var requestId: String = UUID().uuidString.lowercased()
@@ -27,20 +26,15 @@ public final class DoubaoASR: @unchecked Sendable {
     private var pcmBuffer = Data()
     private var didSendFirstFrame = false
     private var canSendAudio = false
-    private var frameTimestampMs: Int64 = 0
     /// VAD-finalized utterances within this recording session, in order.
     private var committedSegments: [String] = []
     /// Latest interim text for the *current* (not-yet-finalized) utterance.
     private var currentInterim: String = ""
     private var isRunning = false
-    private var startedSemaphore: DispatchSemaphore?
 
-    // stop()
-    /// Fresh semaphore per session — recreated in start() so signal counts from
-    /// previous sessions (e.g. from teardown() after a failed start) don't leak forward
-    /// and cause wait() to return immediately without ever giving the server a chance
-    /// to deliver final results.
-    private var finishedSemaphore = DispatchSemaphore(value: 0)
+    /// Fresh channel per session — recreated in _start() so signals from
+    /// previous sessions don't leak forward.
+    private var finishedChannel: OneShotChannel<Void>?
     private var didReceiveFinal = false
 
     /// Whether StartTask has been sent + acked on the current WebSocket. Doubao ties a
@@ -53,20 +47,20 @@ public final class DoubaoASR: @unchecked Sendable {
     /// One-shot filter used by sendInitialMessages to wait for a specific control
     /// response (TaskStarted/SessionStarted) while the persistent receive loop runs.
     private var pendingResponseFilter: ((AsrResponse) -> Bool)?
-    private var pendingResponseSemaphore: DispatchSemaphore?
-    private var pendingResponseResult: AsrResponse?
+    private var pendingResponseChannel: OneShotChannel<AsrResponse>?
 
     /// Signaled by the receive loop when the WS connection has fully torn down,
     /// so closeWebSocket() can wait for the server's Close ack before invalidating
-    /// the URLSession. Set on self.queue before issuing cancel; signaled from the
-    /// receive callback (URLSession's internal queue) — must not be wrapped in
-    /// queue.async or closeWebSocket would deadlock waiting on its own queue.
-    private var wsClosedSemaphore: DispatchSemaphore?
+    /// the URLSession.
+    private var wsClosedChannel: OneShotChannel<Void>?
 
     // Callbacks (assigned in start)
-    private var onPartial: ((String) -> Void)?
-    private var onAudioLevel: ((Float) -> Void)?
-    private var onError: ((Error) -> Void)?
+    private var onPartial: (@Sendable (String) -> Void)?
+    private var onAudioLevel: (@Sendable (Float) -> Void)?
+    private var onError: (@Sendable (Error) -> Void)?
+
+    private var framesSentCount = 0
+    private var totalPcmBytesOut: Int = 0
 
     /// Creates an idle recognizer. No mic access, network, or registration
     /// happens until `start()` is called.
@@ -88,9 +82,15 @@ public final class DoubaoASR: @unchecked Sendable {
     ///     still call `stop()` to clean up.
     ///
     /// Calling `start()` while already running is a no-op.
-    public func start(onPartial: @escaping @Sendable (String) -> Void,
-                      onAudioLevel: @escaping @Sendable (Float) -> Void,
-                      onError: @escaping @Sendable (Error) -> Void) {
+    public nonisolated func start(onPartial: @escaping @Sendable (String) -> Void,
+                                  onAudioLevel: @escaping @Sendable (Float) -> Void,
+                                  onError: @escaping @Sendable (Error) -> Void) {
+        Task { await self._start(onPartial: onPartial, onAudioLevel: onAudioLevel, onError: onError) }
+    }
+
+    private func _start(onPartial: @escaping @Sendable (String) -> Void,
+                        onAudioLevel: @escaping @Sendable (Float) -> Void,
+                        onError: @escaping @Sendable (Error) -> Void) async {
         guard !isRunning else { return }
         isRunning = true
         self.onPartial = onPartial
@@ -103,50 +103,45 @@ public final class DoubaoASR: @unchecked Sendable {
         self.canSendAudio = false
         self.didReceiveFinal = false
         self.framesSentCount = 0
-        self.totalMicBytesIn = 0
         self.totalPcmBytesOut = 0
         self.requestId = UUID().uuidString.lowercased()
-        self.finishedSemaphore = DispatchSemaphore(value: 0)
+        self.finishedChannel = OneShotChannel<Void>()
 
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            NSLog("[DoubaoASR] start() requestId=\(self.requestId)")
+        NSLog("[DoubaoASR] start() requestId=\(requestId)")
 
-            do {
-                let creds = try DoubaoCredentialStore.shared.ensureCredentials()
-                self.token = creds.token
-                self.deviceId = creds.deviceId
-                NSLog("[DoubaoASR] credentials ready device_id=\(creds.deviceId) token_len=\(creds.token.count)")
+        do {
+            let creds = try await DoubaoCredentialStore.shared.ensureCredentials()
+            self.token = creds.token
+            self.deviceId = creds.deviceId
+            NSLog("[DoubaoASR] credentials ready device_id=\(creds.deviceId) token_len=\(creds.token.count)")
 
-                self.opusEncoder = try OpusEncoder()
-                NSLog("[DoubaoASR] opus encoder ready")
+            self.opusEncoder = try OpusEncoder()
+            NSLog("[DoubaoASR] opus encoder ready")
 
-                // Start mic FIRST so audio buffers while we set up the WebSocket.
-                // Doubao kills sessions that go ~900ms without audio after StartSession.
-                try self.startMicTap()
-                NSLog("[DoubaoASR] mic tap started (pre-WS)")
+            // Start mic FIRST so audio buffers while we set up the WebSocket.
+            // Doubao kills sessions that go ~900ms without audio after StartSession.
+            try startMicTap()
+            NSLog("[DoubaoASR] mic tap started (pre-WS)")
 
-                if self.ws == nil {
-                    try self.openWebSocket()
-                    NSLog("[DoubaoASR] websocket opened (fresh)")
-                } else {
-                    NSLog("[DoubaoASR] reusing existing websocket")
-                }
-                try self.sendInitialMessages(deviceId: self.deviceId)
-                NSLog("[DoubaoASR] StartTask + StartSession both succeeded; pcmBufferBytes=\(self.pcmBuffer.count)")
-
-                // Now drain whatever audio accumulated during WS setup.
-                self.canSendAudio = true
-                self.flushPendingFrames()
-            } catch {
-                NSLog("[DoubaoASR] start() failed: \(error.localizedDescription)")
-                self.deliverError(error)
-                // On failure, kill the WS so the next attempt does a clean reconnect.
-                self.closeWebSocket()
-                self.teardownAudio()
-                self.isRunning = false
-                self.signalFinished()
+            if self.ws == nil {
+                try openWebSocket()
+                NSLog("[DoubaoASR] websocket opened (fresh)")
+            } else {
+                NSLog("[DoubaoASR] reusing existing websocket")
             }
+            try await sendInitialMessages(deviceId: self.deviceId)
+            NSLog("[DoubaoASR] StartTask + StartSession both succeeded; pcmBufferBytes=\(self.pcmBuffer.count)")
+
+            // Now drain whatever audio accumulated during WS setup.
+            self.canSendAudio = true
+            try await flushPendingFrames()
+        } catch {
+            NSLog("[DoubaoASR] start() failed: \(error.localizedDescription)")
+            deliverError(error)
+            await closeWebSocket()
+            teardownAudio()
+            isRunning = false
+            signalFinished()
         }
     }
 
@@ -161,43 +156,51 @@ public final class DoubaoASR: @unchecked Sendable {
     ///
     /// Safe to call when not running — completion fires with whatever was
     /// already captured.
-    public func stop(completion: @escaping @Sendable (String) -> Void) {
-        queue.async { [weak self] in
-            guard let self = self else { completion(""); return }
-            NSLog("[DoubaoASR] stop() isRunning=\(self.isRunning)")
-
-            // Even if we never fully started, deliver whatever we have.
-            guard self.isRunning else { completion(self.assembledText()); return }
-            self.isRunning = false
-
-            self.teardownAudio()
-
-            // Drain remaining PCM as a final frame, then FinishSession.
-            do {
-                try self.flushAndSendLastFrame()
-                try self.sendFinishSession()
-            } catch {
-                NSLog("[DoubaoASR] stop send error: \(error.localizedDescription)")
-            }
-
-            // Wait for SessionFinished. Doubao streaming ASR has ~1.5-2s first-response
-            // latency, so for short utterances the server may not have produced any text
-            // by the time the user releases. Give it 2.5s after FinishSession to flush.
-            let waitStart = Date()
-            let result = self.finishedSemaphore.wait(timeout: .now() + 2.5)
-            NSLog("[DoubaoASR] post-Finish wait \(Int(Date().timeIntervalSince(waitStart) * 1000))ms result=\(result == .success ? "signaled" : "timedOut")")
-
-            // Close the WebSocket after every session — same lifecycle as the Python
-            // reference. Keeping the WS open across sessions made Doubao's per-device
-            // concurrent quota fill up after 2-3 fast sessions because the server
-            // appeared to count each finished-but-not-WS-closed session as still
-            // occupying a slot. The ~600ms TLS+StartTask cost per call is the price.
-            self.closeWebSocket()
-
-            let final = self.assembledText()
-            NSLog("[DoubaoASR] stop() final='\(final)' segments=\(self.committedSegments.count)")
+    public nonisolated func stop(completion: @escaping @Sendable (String) -> Void) {
+        Task {
+            let final = await self._stop()
             DispatchQueue.main.async { completion(final) }
         }
+    }
+
+    private func _stop() async -> String {
+        NSLog("[DoubaoASR] stop() isRunning=\(isRunning)")
+        guard isRunning else { return assembledText() }
+        isRunning = false
+
+        teardownAudio()
+
+        // Drain remaining PCM as a final frame, then FinishSession.
+        do {
+            try await flushAndSendLastFrame()
+            try await sendFinishSession()
+        } catch {
+            NSLog("[DoubaoASR] stop send error: \(error.localizedDescription)")
+        }
+
+        // Wait for SessionFinished. Doubao streaming ASR has ~1.5-2s first-response
+        // latency, so for short utterances the server may not have produced any text
+        // by the time the user releases. Give it 2.5s after FinishSession to flush.
+        let waitStart = Date()
+        let outcomeStr: String
+        if let channel = finishedChannel {
+            switch await waitWithTimeout(channel: channel, timeout: 2.5) {
+            case .signaled: outcomeStr = "signaled"
+            case .timeout: outcomeStr = "timedOut"
+            case .cancelled: outcomeStr = "cancelled"
+            case .failed: outcomeStr = "failed"
+            }
+        } else {
+            outcomeStr = "no-channel"
+        }
+        NSLog("[DoubaoASR] post-Finish wait \(Int(Date().timeIntervalSince(waitStart) * 1000))ms result=\(outcomeStr)")
+
+        // Close the WebSocket after every session — see class doc.
+        await closeWebSocket()
+
+        let final = assembledText()
+        NSLog("[DoubaoASR] stop() final='\(final)' segments=\(committedSegments.count)")
+        return final
     }
 
     private func teardownAudio() {
@@ -207,7 +210,7 @@ public final class DoubaoASR: @unchecked Sendable {
         }
     }
 
-    private func closeWebSocket() {
+    private func closeWebSocket() async {
         guard let ws = ws else {
             session?.invalidateAndCancel()
             session = nil
@@ -218,18 +221,18 @@ public final class DoubaoASR: @unchecked Sendable {
         // rescheduling itself if a stray message arrives during the close handshake.
         self.ws = nil
 
-        let sem = DispatchSemaphore(value: 0)
-        wsClosedSemaphore = sem
+        let channel = OneShotChannel<Void>()
+        wsClosedChannel = channel
 
         // Send a WS Close frame (1000 Normal Closure). The server replies with its
         // own Close frame, which surfaces as a .failure on the receive loop and
-        // signals wsClosedSemaphore.
+        // signals wsClosedChannel.
         ws.cancel(with: .normalClosure, reason: nil)
 
-        if sem.wait(timeout: .now() + 1.0) == .timedOut {
+        if case .timeout = await waitWithTimeout(channel: channel, timeout: 1.0) {
             NSLog("[DoubaoASR] WS close handshake timed out — tearing down anyway")
         }
-        wsClosedSemaphore = nil
+        wsClosedChannel = nil
 
         session?.invalidateAndCancel()
         session = nil
@@ -259,12 +262,12 @@ public final class DoubaoASR: @unchecked Sendable {
         startReceiveLoop()
     }
 
-    private func sendInitialMessages(deviceId: String) throws {
+    private func sendInitialMessages(deviceId: String) async throws {
         // StartTask: only on first session of this WebSocket (Doubao binds task to
         // connection; second StartTask would error "task already started").
         if !taskStarted {
-            try sendData(AsrMessageBuilder.startTask(requestId: requestId, token: token))
-            let resp = try waitForResponse(timeout: 5.0) {
+            try await sendData(AsrMessageBuilder.startTask(requestId: requestId, token: token))
+            let resp = try await waitForResponse(timeout: 5.0) {
                 $0.messageType == "TaskStarted" || $0.messageType == "TaskFailed" || $0.messageType == "SessionFailed"
             }
             NSLog("[DoubaoASR] StartTask resp messageType=\(resp.messageType) code=\(resp.statusCode) msg=\(resp.statusMessage)")
@@ -278,8 +281,8 @@ public final class DoubaoASR: @unchecked Sendable {
         }
 
         let configJSON = sessionConfigJSON(deviceId: deviceId)
-        try sendData(AsrMessageBuilder.startSession(requestId: requestId, token: token, configJSON: configJSON))
-        let resp2 = try waitForResponse(timeout: 5.0) {
+        try await sendData(AsrMessageBuilder.startSession(requestId: requestId, token: token, configJSON: configJSON))
+        let resp2 = try await waitForResponse(timeout: 5.0) {
             $0.messageType == "SessionStarted" || $0.messageType == "TaskFailed" || $0.messageType == "SessionFailed"
         }
         NSLog("[DoubaoASR] StartSession resp messageType=\(resp2.messageType) code=\(resp2.statusCode) msg=\(resp2.statusMessage)")
@@ -289,25 +292,23 @@ public final class DoubaoASR: @unchecked Sendable {
         }
     }
 
-    /// Synchronously block the caller's queue until `handleResponseData` sees a
-    /// response matching `predicate`. Used by sendInitialMessages so we can keep a
-    /// single shared receive loop running on the WebSocket (instead of competing
-    /// `ws.receive` calls that would race for messages on a reused connection).
-    private func waitForResponse(timeout: TimeInterval, where predicate: @escaping (AsrResponse) -> Bool) throws -> AsrResponse {
-        let sem = DispatchSemaphore(value: 0)
+    /// Suspend until `handleResponseData` sees a response matching `predicate`,
+    /// or until `timeout` elapses. Used by sendInitialMessages so we can keep a
+    /// single shared receive loop running on the WebSocket.
+    private func waitForResponse(timeout: TimeInterval, where predicate: @escaping (AsrResponse) -> Bool) async throws -> AsrResponse {
+        let channel = OneShotChannel<AsrResponse>(AsrResponse.self)
         pendingResponseFilter = predicate
-        pendingResponseSemaphore = sem
-        pendingResponseResult = nil
+        pendingResponseChannel = channel
 
-        let timedOut = sem.wait(timeout: .now() + timeout) == .timedOut
-        let result = pendingResponseResult
+        let outcome = await waitWithTimeout(channel: channel, timeout: timeout)
         pendingResponseFilter = nil
-        pendingResponseSemaphore = nil
-        pendingResponseResult = nil
+        pendingResponseChannel = nil
 
-        if timedOut { throw URLError(.timedOut) }
-        guard let r = result else { throw URLError(.cannotParseResponse) }
-        return r
+        switch outcome {
+        case .signaled(let r): return r
+        case .timeout: throw URLError(.timedOut)
+        case .cancelled, .failed: throw URLError(.cannotParseResponse)
+        }
     }
 
     private func sessionConfigJSON(deviceId: String) -> String {
@@ -332,64 +333,55 @@ public final class DoubaoASR: @unchecked Sendable {
         return String(data: data, encoding: .utf8) ?? "{}"
     }
 
-    private func sendFinishSession() throws {
-        try sendData(AsrMessageBuilder.finishSession(requestId: requestId, token: token))
+    private func sendFinishSession() async throws {
+        try await sendData(AsrMessageBuilder.finishSession(requestId: requestId, token: token))
     }
 
-    private func sendData(_ data: Data) throws {
+    private func sendData(_ data: Data) async throws {
         guard let ws = ws else { throw URLError(.networkConnectionLost) }
-        let sem = DispatchSemaphore(value: 0)
-        var sendErr: Error?
-        ws.send(.data(data)) { err in
-            sendErr = err
-            sem.signal()
-        }
-        if sem.wait(timeout: .now() + 5.0) == .timedOut {
-            throw URLError(.timedOut)
-        }
-        if let e = sendErr { throw e }
+        try await ws.send(.data(data))
     }
 
     private func startReceiveLoop() {
         guard let ws = ws else { return }
         ws.receive { [weak self] result in
-            guard let self = self else { return }
-            switch result {
-            case .success(let msg):
-                let data: Data
-                switch msg {
-                case .data(let d):   data = d
-                case .string(let s): data = Data(s.utf8)
-                @unknown default:    data = Data()
-                }
-                if !data.isEmpty {
-                    self.handleResponseData(data)
-                }
-                // Keep listening as long as the WebSocket is alive.
-                if self.ws != nil {
-                    self.startReceiveLoop()
-                }
-            case .failure(let err):
-                NSLog("[DoubaoASR] receive failed: \(err.localizedDescription)")
-                // Wake any closeWebSocket() blocked on the close handshake. Signal
-                // here (outside queue.async) — closeWebSocket() runs on self.queue
-                // and the queued block below cannot execute until it returns.
-                self.wsClosedSemaphore?.signal()
-                self.queue.async {
-                    if self.isRunning {
-                        self.deliverError(err)
-                    }
-                    // Connection is dead — drop references so next start() reopens.
-                    self.ws = nil
-                    self.session?.invalidateAndCancel()
-                    self.session = nil
-                    self.taskStarted = false
-                    self.pendingResponseFilter = nil
-                    self.pendingResponseSemaphore?.signal()
-                    self.pendingResponseSemaphore = nil
-                    self.signalFinished()
-                }
+            // Bridge URLSession's delegate-queue callback into the actor.
+            Task { await self?.handleReceiveResult(result) }
+        }
+    }
+
+    private func handleReceiveResult(_ result: Result<URLSessionWebSocketTask.Message, Error>) async {
+        switch result {
+        case .success(let msg):
+            let data: Data
+            switch msg {
+            case .data(let d):   data = d
+            case .string(let s): data = Data(s.utf8)
+            @unknown default:    data = Data()
             }
+            if !data.isEmpty {
+                handleResponseData(data)
+            }
+            // Keep listening as long as the WebSocket is alive.
+            if self.ws != nil {
+                startReceiveLoop()
+            }
+        case .failure(let err):
+            NSLog("[DoubaoASR] receive failed: \(err.localizedDescription)")
+            // Wake any closeWebSocket() awaiting the close handshake.
+            wsClosedChannel?.finish(())
+            if isRunning {
+                deliverError(err)
+            }
+            // Connection is dead — drop references so next start() reopens.
+            ws = nil
+            session?.invalidateAndCancel()
+            session = nil
+            taskStarted = false
+            pendingResponseFilter = nil
+            pendingResponseChannel?.finish(throwing: CancellationError())
+            pendingResponseChannel = nil
+            signalFinished()
         }
     }
 
@@ -408,11 +400,11 @@ public final class DoubaoASR: @unchecked Sendable {
         }
 
         // sendInitialMessages waits for a specific control response — if this matches,
-        // hand it back synchronously and skip the streaming-result handling below.
+        // hand it back and skip the streaming-result handling below.
         if let pred = pendingResponseFilter, pred(resp) {
-            pendingResponseResult = resp
             pendingResponseFilter = nil
-            pendingResponseSemaphore?.signal()
+            pendingResponseChannel?.finish(resp)
+            pendingResponseChannel = nil
             return
         }
 
@@ -468,7 +460,8 @@ public final class DoubaoASR: @unchecked Sendable {
                 currentInterim = text
             }
             let display = committedSegments.joined() + currentInterim
-            DispatchQueue.main.async { [display, weak self] in self?.onPartial?(display) }
+            let cb = onPartial
+            DispatchQueue.main.async { cb?(display) }
         }
     }
 
@@ -477,7 +470,7 @@ public final class DoubaoASR: @unchecked Sendable {
     }
 
     private func signalFinished() {
-        finishedSemaphore.signal()
+        finishedChannel?.finish(())
     }
 
     // MARK: - Mic capture
@@ -501,74 +494,62 @@ public final class DoubaoASR: @unchecked Sendable {
         }
         self.pcmConverter = converter
 
+        // Snapshot for the audio-thread closure so it doesn't reach into actor state.
+        let audioLevelCallback = self.onAudioLevel
+        let capturedConverter = UncheckedSendable(converter)
+        let capturedTarget = UncheckedSendable(target)
+
         inputNode.removeTap(onBus: 0)
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: inFormat) { [weak self] buffer, _ in
-            self?.handleMicBuffer(buffer)
+            // Audio thread — must not block.
+            let level = AudioLevel.computeRMS(buffer)
+            DispatchQueue.main.async { audioLevelCallback?(level) }
+
+            let converter = capturedConverter.value
+            let target = capturedTarget.value
+
+            let ratio = target.sampleRate / buffer.format.sampleRate
+            let outCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 1024)
+            guard let outBuf = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: outCapacity) else { return }
+
+            var fed = false
+            var convError: NSError?
+            _ = converter.convert(to: outBuf, error: &convError) { _, outStatus in
+                if fed {
+                    outStatus.pointee = .noDataNow
+                    return nil
+                }
+                fed = true
+                outStatus.pointee = .haveData
+                return buffer
+            }
+            if let e = convError {
+                NSLog("[DoubaoASR] mic convert error: \(e)")
+                return
+            }
+            let n = Int(outBuf.frameLength)
+            guard n > 0, let src = outBuf.int16ChannelData?[0] else { return }
+
+            let byteCount = n * MemoryLayout<Int16>.size
+            let chunk = Data(bytes: src, count: byteCount)
+
+            Task { await self?.appendAndDrainPCM(chunk) }
         }
 
         audioEngine.prepare()
         try audioEngine.start()
     }
 
-    private var totalMicBytesIn: Int = 0
-    private var totalPcmBytesOut: Int = 0
-
-    private func handleMicBuffer(_ buffer: AVAudioPCMBuffer) {
-        let level = AudioLevel.computeRMS(buffer)
-        DispatchQueue.main.async { [weak self] in self?.onAudioLevel?(level) }
-
-        guard let converter = pcmConverter,
-              let target = pcmTargetFormat else { return }
-
-        let inFrames = Int(buffer.frameLength)
-        totalMicBytesIn += inFrames * 4   // assume Float32 stereo or whatever — diagnostic only
-
-        // Convert variable-rate mic buffer → 16kHz Int16 mono.
-        let ratio = target.sampleRate / buffer.format.sampleRate
-        let outCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 1024)
-        guard let outBuf = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: outCapacity) else { return }
-
-        var fed = false
-        var convError: NSError?
-        let status = converter.convert(to: outBuf, error: &convError) { _, outStatus in
-            if fed {
-                outStatus.pointee = .noDataNow
-                return nil
-            }
-            fed = true
-            outStatus.pointee = .haveData
-            return buffer
-        }
-        if let e = convError {
-            NSLog("[DoubaoASR] mic convert error: \(e)")
-            return
-        }
-        // status .inputRanDry (1) is normal for streaming resampling — converter consumed our
-        // input and needs more, but may have already produced output. Use whatever's in outBuf.
-        _ = status
-        let n = Int(outBuf.frameLength)
-        guard n > 0, let src = outBuf.int16ChannelData?[0] else { return }
-
-        let byteCount = n * MemoryLayout<Int16>.size
-        totalPcmBytesOut += byteCount
-        let chunk = Data(bytes: src, count: byteCount)
-
-        queue.async { [weak self] in
-            self?.appendAndDrainPCM(chunk)
-        }
-    }
-
-    private var framesSentCount = 0
-
-    private func appendAndDrainPCM(_ data: Data) {
+    private func appendAndDrainPCM(_ data: Data) async {
         guard isRunning else { return }
+        totalPcmBytesOut += data.count
         pcmBuffer.append(data)
-        flushPendingFrames()
+        try? await flushPendingFrames()
     }
 
     /// Sends as many complete 20ms frames as the buffer holds. No-op until
     /// `canSendAudio` is true (i.e., until StartSession has succeeded).
-    private func flushPendingFrames() {
+    private func flushPendingFrames() async throws {
         guard canSendAudio else { return }
         let frameSize = DoubaoConstants.bytesPerFrame
         while pcmBuffer.count >= frameSize {
@@ -576,7 +557,7 @@ public final class DoubaoASR: @unchecked Sendable {
             pcmBuffer.removeFirst(frameSize)
             do {
                 let state: FrameState = didSendFirstFrame ? .middle : .first
-                try encodeAndSend(Data(frame), state: state)
+                try await encodeAndSend(Data(frame), state: state)
                 if !didSendFirstFrame {
                     NSLog("[DoubaoASR] sent FIRST frame")
                 }
@@ -590,14 +571,14 @@ public final class DoubaoASR: @unchecked Sendable {
         }
     }
 
-    private func flushAndSendLastFrame() throws {
+    private func flushAndSendLastFrame() async throws {
         NSLog("[DoubaoASR] flushAndSendLastFrame framesSent=\(framesSentCount) pcmBufferRemaining=\(pcmBuffer.count) didSendFirst=\(didSendFirstFrame) totalPcmBytesOut=\(totalPcmBytesOut)")
         let frameSize = DoubaoConstants.bytesPerFrame
         if pcmBuffer.isEmpty {
             // Still need a LAST marker if any frames were sent.
             if didSendFirstFrame {
                 let silent = Data(count: frameSize)
-                try encodeAndSend(silent, state: .last)
+                try await encodeAndSend(silent, state: .last)
                 NSLog("[DoubaoASR] sent LAST silent")
             }
             return
@@ -608,11 +589,11 @@ public final class DoubaoASR: @unchecked Sendable {
         }
         let frame = Data(pcmBuffer.prefix(frameSize))
         pcmBuffer.removeAll()
-        try encodeAndSend(frame, state: .last)
+        try await encodeAndSend(frame, state: .last)
         NSLog("[DoubaoASR] sent LAST frame")
     }
 
-    private func encodeAndSend(_ pcmFrame: Data, state: FrameState) throws {
+    private func encodeAndSend(_ pcmFrame: Data, state: FrameState) async throws {
         guard let encoder = opusEncoder else { return }
         let opus = try encoder.encode(pcmFrame)
         let now = Int64(Date().timeIntervalSince1970 * 1000)
@@ -622,12 +603,42 @@ public final class DoubaoASR: @unchecked Sendable {
             frameState: state,
             timestampMs: now
         )
-        try sendData(msg)
+        try await sendData(msg)
     }
 
     // MARK: - Helpers
 
     private func deliverError(_ error: Error) {
-        DispatchQueue.main.async { [weak self] in self?.onError?(error) }
+        let cb = onError
+        DispatchQueue.main.async { cb?(error) }
+    }
+
+    private enum WaitOutcome<T: Sendable>: Sendable {
+        case signaled(T)
+        case timeout
+        case cancelled
+        case failed
+    }
+
+    private func waitWithTimeout<T: Sendable>(channel: OneShotChannel<T>, timeout: TimeInterval) async -> WaitOutcome<T> {
+        await withTaskGroup(of: WaitOutcome<T>.self) { group in
+            group.addTask {
+                do {
+                    let v = try await channel.wait()
+                    return .signaled(v)
+                } catch is CancellationError {
+                    return .cancelled
+                } catch {
+                    return .failed
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                return .timeout
+            }
+            let first = await group.next() ?? .failed
+            group.cancelAll()
+            return first
+        }
     }
 }
