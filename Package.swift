@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "DoubaoASR",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v14), .iOS(.v18)],
     products: [
         .library(name: "DoubaoASR", targets: ["DoubaoASR"])
     ],
