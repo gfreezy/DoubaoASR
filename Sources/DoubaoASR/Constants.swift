@@ -8,7 +8,11 @@ enum DoubaoConstants {
 
     static let userAgent = "com.bytedance.android.doubaoime/100102018 (Linux; U; Android 16; en_US; Pixel 7 Pro; Build/BP2A.250605.031.A2; Cronet/TTNetVersion:94cf429a 2025-11-17 QuicVersion:1f89f732 2025-05-08)"
 
-    static let appConfig: [String: Any] = [
+    // `nonisolated(unsafe)`: these dictionaries are read-only after init and only
+    // ever read (never mutated) from the ASR pipeline. Under Swift 6's strict
+    // concurrency the `[String: Any]` type is not Sendable, so we opt out
+    // explicitly rather than wrap each in a Sendable struct.
+    nonisolated(unsafe) static let appConfig: [String: Any] = [
         "aid": 401734,
         "app_name": "oime",
         "version_code": 100102018,
@@ -19,7 +23,7 @@ enum DoubaoConstants {
         "package": "com.bytedance.android.doubaoime"
     ]
 
-    static let deviceConfig: [String: Any] = [
+    nonisolated(unsafe) static let deviceConfig: [String: Any] = [
         "device_platform": "android",
         "os": "android",
         "os_api": "34",
