@@ -56,6 +56,13 @@ public final class DoubaoASR {
     private var pendingResponseSemaphore: DispatchSemaphore?
     private var pendingResponseResult: AsrResponse?
 
+    /// Signaled by the receive loop when the WS connection has fully torn down,
+    /// so closeWebSocket() can wait for the server's Close ack before invalidating
+    /// the URLSession. Set on self.queue before issuing cancel; signaled from the
+    /// receive callback (URLSession's internal queue) — must not be wrapped in
+    /// queue.async or closeWebSocket would deadlock waiting on its own queue.
+    private var wsClosedSemaphore: DispatchSemaphore?
+
     // Callbacks (assigned in start)
     private var onPartial: ((String) -> Void)?
     private var onAudioLevel: ((Float) -> Void)?
@@ -201,8 +208,29 @@ public final class DoubaoASR {
     }
 
     private func closeWebSocket() {
-        ws?.cancel(with: .goingAway, reason: nil)
-        ws = nil
+        guard let ws = ws else {
+            session?.invalidateAndCancel()
+            session = nil
+            taskStarted = false
+            return
+        }
+        // Drop our reference first so the receive loop's success branch stops
+        // rescheduling itself if a stray message arrives during the close handshake.
+        self.ws = nil
+
+        let sem = DispatchSemaphore(value: 0)
+        wsClosedSemaphore = sem
+
+        // Send a WS Close frame (1000 Normal Closure). The server replies with its
+        // own Close frame, which surfaces as a .failure on the receive loop and
+        // signals wsClosedSemaphore.
+        ws.cancel(with: .normalClosure, reason: nil)
+
+        if sem.wait(timeout: .now() + 1.0) == .timedOut {
+            NSLog("[DoubaoASR] WS close handshake timed out — tearing down anyway")
+        }
+        wsClosedSemaphore = nil
+
         session?.invalidateAndCancel()
         session = nil
         taskStarted = false
@@ -343,6 +371,10 @@ public final class DoubaoASR {
                 }
             case .failure(let err):
                 NSLog("[DoubaoASR] receive failed: \(err.localizedDescription)")
+                // Wake any closeWebSocket() blocked on the close handshake. Signal
+                // here (outside queue.async) — closeWebSocket() runs on self.queue
+                // and the queued block below cannot execute until it returns.
+                self.wsClosedSemaphore?.signal()
                 self.queue.async {
                     if self.isRunning {
                         self.deliverError(err)
