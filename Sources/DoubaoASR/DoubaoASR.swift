@@ -9,7 +9,7 @@ import AVFoundation
 /// the Python reference. Reusing the connection across recordings caused
 /// Doubao's per-device concurrent quota to fill up after a few fast
 /// sessions; the ~600ms TLS+StartTask cost per call is the price.
-public final class DoubaoASR {
+public final class DoubaoASR: @unchecked Sendable {
     private let audioEngine = AVAudioEngine()
     private var pcmConverter: AVAudioConverter?
     private var pcmTargetFormat: AVAudioFormat!
@@ -88,9 +88,9 @@ public final class DoubaoASR {
     ///     still call `stop()` to clean up.
     ///
     /// Calling `start()` while already running is a no-op.
-    public func start(onPartial: @escaping (String) -> Void,
-                      onAudioLevel: @escaping (Float) -> Void,
-                      onError: @escaping (Error) -> Void) {
+    public func start(onPartial: @escaping @Sendable (String) -> Void,
+                      onAudioLevel: @escaping @Sendable (Float) -> Void,
+                      onError: @escaping @Sendable (Error) -> Void) {
         guard !isRunning else { return }
         isRunning = true
         self.onPartial = onPartial
@@ -161,7 +161,7 @@ public final class DoubaoASR {
     ///
     /// Safe to call when not running — completion fires with whatever was
     /// already captured.
-    public func stop(completion: @escaping (String) -> Void) {
+    public func stop(completion: @escaping @Sendable (String) -> Void) {
         queue.async { [weak self] in
             guard let self = self else { completion(""); return }
             NSLog("[DoubaoASR] stop() isRunning=\(self.isRunning)")
