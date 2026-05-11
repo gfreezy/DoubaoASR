@@ -16,7 +16,10 @@ struct DeviceCredentials: Codable {
 /// before any ASR call. Credentials are cached to
 /// `~/Library/Application Support/SpeechMore/credentials.json` so subsequent
 /// app launches start in milliseconds.
-public final class DoubaoCredentialStore {
+/// Thread-safe by construction: `cached` is wrapped in `Lock<T>` and `fileURL`
+/// is immutable. `@unchecked Sendable` so `static let shared` is allowed under
+/// Swift 6's strict-concurrency checking.
+public final class DoubaoCredentialStore: @unchecked Sendable {
     /// Shared singleton. There is no reason to construct multiple instances —
     /// they would race over the same on-disk cache.
     public static let shared = DoubaoCredentialStore()
