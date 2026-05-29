@@ -8,7 +8,7 @@ let package = Package(
         .library(name: "DoubaoASR", targets: ["DoubaoASR"])
     ],
     dependencies: [
-        .package(url: "https://github.com/gfreezy/talkercommon", exact: "20260505.0.3")
+        .package(url: "https://github.com/gfreezy/talkercommon", exact: "20260529.0.1")
     ],
     targets: [
         .target(
